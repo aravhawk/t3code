@@ -400,6 +400,13 @@ const decodeNoteEntry = Schema.decodeUnknownExit(RawNoteSchema);
 const decodeUserEntry = Schema.decodeUnknownExit(RawUserSchema);
 const decodeCommitEntry = Schema.decodeUnknownExit(RawCommitSchema);
 const decodeCommit = decodeJsonResult(RawCommitSchema);
+const decodeMergeRequestChanges = decodeJsonResult(
+  Schema.Struct({
+    changes: Schema.Array(Schema.Unknown),
+    overflow: Schema.optional(Schema.Boolean),
+    changes_count: Schema.optional(Schema.String),
+  }),
+);
 const decodeDiffEntry = Schema.decodeUnknownExit(RawDiffSchema);
 const decodeDiscussionEntry = Schema.decodeUnknownExit(RawDiscussionSchema);
 const decodeDiffRefs = decodeJsonResult(RawDiffRefsSchema);
@@ -706,9 +713,29 @@ export function decodeMergeRequestDiffsJson(
   if (!Result.isSuccess(decoded)) {
     return Result.fail(decoded.failure);
   }
+  return Result.succeed(mergeRequestPatch(decoded.success));
+}
+
+/** Older GitLab instances return all files in a non-paginated merge request wrapper. */
+export function decodeMergeRequestChangesJson(
+  raw: string,
+): Result.Result<GitLabMergeRequestPatch, DecodeFailure> {
+  const decoded = decodeMergeRequestChanges(raw);
+  if (!Result.isSuccess(decoded)) return Result.fail(decoded.failure);
+  const patch = mergeRequestPatch(decoded.success.changes);
+  return Result.succeed({
+    ...patch,
+    truncated:
+      patch.truncated ||
+      decoded.success.overflow === true ||
+      decoded.success.changes_count?.endsWith("+") === true,
+  });
+}
+
+function mergeRequestPatch(entries: ReadonlyArray<unknown>): GitLabMergeRequestPatch {
   const sections: string[] = [];
   let truncated = false;
-  for (const entry of decoded.success) {
+  for (const entry of entries) {
     const file = decodeDiffEntry(entry);
     if (Exit.isFailure(file)) continue;
     const value = file.value;
@@ -733,11 +760,11 @@ export function decodeMergeRequestDiffsJson(
     ].join("\n");
     sections.push(hunks.length === 0 ? header : `${header}\n${hunks.replace(/\n?$/, "\n")}`);
   }
-  return Result.succeed({
+  return {
     patch: sections.join("\n"),
     truncated,
-    rawCount: decoded.success.length,
-  });
+    rawCount: entries.length,
+  };
 }
 
 /** GitLab's award names for the eight reactions the contract carries. */
