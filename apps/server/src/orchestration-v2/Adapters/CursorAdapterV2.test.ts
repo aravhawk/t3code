@@ -1,6 +1,7 @@
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { assert, describe, it } from "@effect/vitest";
 import type { InteractionUpdate } from "@cursor/sdk";
+import type { CursorAgentSdkOpenInput, CursorAgentSdkSendInput } from "./CursorAgentSdk.ts";
 import {
   CursorSettings,
   EnvironmentId,
@@ -39,6 +40,219 @@ import { isCursorCancellationError, loggedCursorAgentOptions } from "./CursorAge
 const decodeCursorSettings = Schema.decodeEffect(CursorSettings);
 
 describe("CursorAdapterV2", () => {
+  it.effect.each([false, true])(
+    "keeps MCP configuration on create/resume across credential changes (initial MCP: %s)",
+    (initialMcp) =>
+      Effect.gen(function* () {
+        const fileSystem = yield* FileSystem.FileSystem;
+        const path = yield* Path.Path;
+        const workspace = yield* fileSystem.makeTempDirectoryScoped({ prefix: "cursor-mcp-" });
+        const instanceId = ProviderInstanceId.make("cursor");
+        const threadId = ThreadId.make("cursor-mcp-lifecycle");
+        yield* Effect.addFinalizer(() =>
+          Effect.sync(() => McpProviderSession.clearMcpProviderSession(threadId)),
+        );
+        const modelSelection = { instanceId, model: "composer-2.5" };
+        const runtimePolicy = ProviderAdapterV2RuntimePolicy.make({
+          runtimeMode: "full-access",
+          interactionMode: "default",
+          cwd: workspace,
+        });
+        const opened: Array<CursorAgentSdkOpenInput> = [];
+        const sent: Array<CursorAgentSdkSendInput<never>["options"]> = [];
+        const calls: Array<string> = [];
+        const setCredential = (
+          authorizationHeader: string,
+          endpoint = "http://127.0.0.1:43123/mcp",
+        ) =>
+          McpProviderSession.setMcpProviderSession({
+            environmentId: EnvironmentId.make("cursor-mcp-environment"),
+            threadId,
+            providerSessionId: "cursor-mcp-session",
+            providerInstanceId: instanceId,
+            endpoint,
+            authorizationHeader,
+            browserToolsAvailable: true,
+          });
+        const adapter = makeCursorAdapterV2({
+          instanceId,
+          settings: yield* decodeCursorSettings({}),
+          environment: { HOME: workspace, CURSOR_API_KEY: "synthetic-cursor-api-key" },
+          fileSystem,
+          path,
+          idAllocator: yield* IdAllocator.IdAllocatorV2,
+          serverConfig: yield* ServerConfig.ServerConfig.pipe(
+            Effect.provide(ServerConfig.layerTest(workspace, { prefix: "cursor-mcp-config-" })),
+          ),
+          runner: {
+            assertComplete: Effect.void,
+            open: (input) =>
+              Effect.sync(() => {
+                opened.push(input);
+                calls.push(input.operation);
+                if (input.operation === "resume") assert.equal(input.agentId, "native-cursor-mcp");
+                return {
+                  agentId: "native-cursor-mcp",
+                  listMessages: Effect.succeed([]),
+                  close: Effect.sync(() => {
+                    calls.push("close");
+                  }),
+                  send: (sendInput) =>
+                    Effect.sync(() => {
+                      sent.push(sendInput.options);
+                      calls.push("send");
+                      const runId = `native-run-${sent.length}`;
+                      return {
+                        agentId: "native-cursor-mcp",
+                        runId,
+                        cancel: Effect.void,
+                        wait: Effect.succeed({
+                          id: runId,
+                          requestId: runId,
+                          status: "finished" as const,
+                          model: { id: "composer-2.5" },
+                          durationMs: 1,
+                        }),
+                      };
+                    }),
+                };
+              }),
+          },
+        });
+        const openRuntime = () =>
+          adapter.openSession({
+            threadId,
+            providerSessionId: ProviderSessionId.make("cursor-mcp-session"),
+            modelSelection,
+            runtimePolicy,
+          });
+        if (initialMcp) setCredential("Bearer synthetic-created");
+        let runtime = yield* openRuntime();
+        const providerThread = yield* runtime.ensureThread({
+          threadId,
+          modelSelection,
+          runtimePolicy,
+        });
+        const now = yield* DateTime.now;
+        const turn = Effect.fnUntraced(function* () {
+          const ordinal = sent.length + 1;
+          yield* runtime.startTurn({
+            threadId,
+            providerThread,
+            modelSelection,
+            runtimePolicy,
+            runId: RunId.make(`cursor-mcp-run-${ordinal}`),
+            runOrdinal: ordinal,
+            providerTurnOrdinal: ordinal,
+            attemptId: RunAttemptId.make(`cursor-mcp-attempt-${ordinal}`),
+            rootNodeId: NodeId.make(`cursor-mcp-root-${ordinal}`),
+            appThread: {
+              id: threadId,
+              projectId: ProjectId.make("cursor-mcp-project"),
+              createdBy: "user",
+              creationSource: "web",
+              title: "Cursor lifecycle",
+              providerInstanceId: instanceId,
+              modelSelection,
+              runtimeMode: "full-access",
+              interactionMode: "default",
+              branch: null,
+              worktreePath: null,
+              activeProviderThreadId: providerThread.id,
+              lineage: { parentThreadId: null, relationshipToParent: null, rootThreadId: threadId },
+              forkedFrom: null,
+              createdAt: now,
+              updatedAt: now,
+              archivedAt: null,
+              settledOverride: null,
+              settledAt: null,
+              lastVisitedAt: null,
+              deletedAt: null,
+            },
+            message: {
+              messageId: MessageId.make(`cursor-mcp-message-${ordinal}`),
+              createdBy: "user",
+              creationSource: "web",
+              text: "List available tools.",
+              attachments: [],
+            },
+          });
+          const events = yield* runtime.events.pipe(
+            Stream.takeUntil((event) => event.type === "turn.terminal"),
+            Stream.runCollect,
+          );
+          assert.equal(events.at(-1)?.type, "turn.terminal");
+          assert.isFalse(Object.hasOwn(sent.at(-1)!, "mcpServers"));
+        });
+        const assertCredential = (
+          authorizationHeader: string,
+          endpoint = "http://127.0.0.1:43123/mcp",
+        ) => {
+          assert.deepEqual(opened.at(-1)?.options.mcpServers, {
+            "t3-code": {
+              type: "http",
+              url: endpoint,
+              headers: { Authorization: authorizationHeader },
+            },
+          });
+          assert.deepEqual(opened.at(-1)?.options.local?.settingSources, [
+            "project",
+            "user",
+            "team",
+            "mdm",
+            "plugins",
+          ]);
+        };
+
+        // No injected server leaves the SDK free to load ambient settings.
+        yield* turn();
+        assert.deepEqual(calls, ["create", "send"]);
+        if (initialMcp) assertCredential("Bearer synthetic-created");
+        else assert.isUndefined(opened[0]?.options.mcpServers);
+
+        // Installing, rotating, changing the endpoint, and removing the credential
+        // must each reopen the same native thread before its next send.
+        setCredential("Bearer synthetic-first");
+        yield* turn();
+        assert.deepEqual(calls.slice(-3), ["close", "resume", "send"]);
+        assertCredential("Bearer synthetic-first");
+        const beforeReuse = opened.length;
+        setCredential("Bearer synthetic-first");
+        yield* turn();
+        assert.equal(opened.length, beforeReuse);
+        assert.equal(calls.at(-2), "send");
+
+        setCredential("Bearer synthetic-rotated");
+        yield* turn();
+        assert.equal(opened.length, beforeReuse + 1);
+        assert.deepEqual(calls.slice(-3), ["close", "resume", "send"]);
+        assertCredential("Bearer synthetic-rotated");
+
+        setCredential("Bearer synthetic-rotated", "http://127.0.0.1:43124/mcp");
+        yield* turn();
+        assert.equal(opened.length, beforeReuse + 2);
+        assertCredential("Bearer synthetic-rotated", "http://127.0.0.1:43124/mcp");
+
+        McpProviderSession.clearMcpProviderSession(threadId);
+        yield* turn();
+        assert.equal(opened.length, beforeReuse + 3);
+        assert.isUndefined(opened.at(-1)?.options.mcpServers);
+        assert.deepEqual(calls.slice(-3), ["close", "resume", "send"]);
+
+        // A fresh adapter runtime resumes durable identity with current credentials.
+        setCredential("Bearer synthetic-resumed");
+        runtime = yield* openRuntime();
+        const resumed = yield* runtime.resumeThread({ providerThread });
+        assert.equal(resumed.id, providerThread.id);
+        assert.deepEqual(resumed.nativeThreadRef, providerThread.nativeThreadRef);
+        assertCredential("Bearer synthetic-resumed");
+        const beforeResumedSend = opened.length;
+        yield* turn();
+        assert.equal(opened.length, beforeResumedSend);
+        assert.deepEqual(calls.slice(-2), ["resume", "send"]);
+      }).pipe(Effect.scoped, Effect.provide(Layer.merge(NodeServices.layer, IdAllocator.layer))),
+  );
+
   it.effect.each([
     { status: "finished", model: undefined },
     { status: "cancelled", model: "claude-opus-4-6" },

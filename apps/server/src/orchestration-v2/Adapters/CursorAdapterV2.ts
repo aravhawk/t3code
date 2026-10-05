@@ -33,6 +33,7 @@ import {
 import * as DateTime from "effect/DateTime";
 import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
+import * as Equal from "effect/Equal";
 import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
@@ -839,6 +840,7 @@ interface ActiveCursorTurn {
 interface CursorLiveAgent {
   readonly nativeThreadId: string;
   readonly session: CursorAgentSdk.CursorAgentSdkSession;
+  readonly mcpServers: AgentOptions["mcpServers"];
 }
 
 export interface CursorAdapterV2Options {
@@ -2072,11 +2074,20 @@ export function makeCursorAdapterV2(
           readonly runtimePolicy: ProviderAdapter.ProviderAdapterV2RuntimePolicy;
           readonly agentId?: string;
         }) {
+          // Send-level MCP overrides replace Cursor's ambient servers. Refresh
+          // rotated credentials by reopening the same native thread instead.
+          const options = makeCursorAgentOptions({
+            ...(apiKey === undefined ? {} : { apiKey }),
+            modelSelection: openInput.modelSelection,
+            runtimePolicy: openInput.runtimePolicy,
+            threadId: openInput.threadId,
+          });
           const existing = yield* Ref.get(liveAgent);
           if (
             existing !== null &&
             openInput.operation === "resume" &&
-            existing.nativeThreadId === openInput.agentId
+            existing.nativeThreadId === openInput.agentId &&
+            Equal.equals(existing.mcpServers, options.mcpServers)
           ) {
             return existing;
           }
@@ -2087,18 +2098,14 @@ export function makeCursorAdapterV2(
           const sdkSession = yield* runner.open({
             operation: openInput.operation,
             ...(openInput.agentId === undefined ? {} : { agentId: openInput.agentId }),
-            options: makeCursorAgentOptions({
-              ...(apiKey === undefined ? {} : { apiKey }),
-              modelSelection: openInput.modelSelection,
-              runtimePolicy: openInput.runtimePolicy,
-              threadId: openInput.threadId,
-            }),
+            options,
             threadId: openInput.threadId,
             providerSessionId: input.providerSessionId,
           });
           const next = {
             nativeThreadId: sdkSession.agentId,
             session: sdkSession,
+            mcpServers: options.mcpServers,
           } satisfies CursorLiveAgent;
           yield* Ref.set(liveAgent, next);
           return next;
@@ -2202,7 +2209,6 @@ export function makeCursorAdapterV2(
               runtimePolicy: turnInput.runtimePolicy,
             });
             const message = yield* resolveUserMessage(turnInput);
-            const mcpServers = cursorMcpServers(turnInput.threadId);
             const pendingUpdates: Array<InteractionUpdate> = [];
             let context: ActiveCursorTurn | null = null;
             const sdkRun = yield* agent.session.send({
@@ -2210,7 +2216,6 @@ export function makeCursorAdapterV2(
               options: {
                 model: cursorSdkModelSelection(turnInput.modelSelection),
                 mode: turnInput.runtimePolicy.interactionMode === "plan" ? "plan" : "agent",
-                ...(mcpServers === undefined ? {} : { mcpServers }),
               },
               onDelta: (update) => {
                 if (context === null) {
