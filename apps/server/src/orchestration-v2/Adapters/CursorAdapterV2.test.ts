@@ -35,7 +35,11 @@ import {
   makeCursorAdapterV2,
   nestedToolCallFromEnvelope,
 } from "./CursorAdapterV2.ts";
-import { isCursorCancellationError, loggedCursorAgentOptions } from "./CursorAgentSdk.ts";
+import {
+  CursorAgentSdkRunnerError,
+  isCursorCancellationError,
+  loggedCursorAgentOptions,
+} from "./CursorAgentSdk.ts";
 
 const decodeCursorSettings = Schema.decodeEffect(CursorSettings);
 
@@ -61,6 +65,8 @@ describe("CursorAdapterV2", () => {
         const opened: Array<CursorAgentSdkOpenInput> = [];
         const sent: Array<CursorAgentSdkSendInput<never>["options"]> = [];
         const calls: Array<string> = [];
+        let failNextResume = false;
+        let failNextClose = false;
         const setCredential = (
           authorizationHeader: string,
           endpoint = "http://127.0.0.1:43123/mcp",
@@ -87,15 +93,29 @@ describe("CursorAdapterV2", () => {
           runner: {
             assertComplete: Effect.void,
             open: (input) =>
-              Effect.sync(() => {
+              Effect.gen(function* () {
                 opened.push(input);
                 calls.push(input.operation);
                 if (input.operation === "resume") assert.equal(input.agentId, "native-cursor-mcp");
+                if (failNextResume) {
+                  failNextResume = false;
+                  return yield* new CursorAgentSdkRunnerError({
+                    method: "agent.resume",
+                    cause: new Error("Synthetic resume failure"),
+                  });
+                }
                 return {
                   agentId: "native-cursor-mcp",
                   listMessages: Effect.succeed([]),
-                  close: Effect.sync(() => {
+                  close: Effect.gen(function* () {
                     calls.push("close");
+                    if (failNextClose) {
+                      failNextClose = false;
+                      return yield* new CursorAgentSdkRunnerError({
+                        method: "agent.close",
+                        cause: new Error("Synthetic close failure"),
+                      });
+                    }
                   }),
                   send: (sendInput) =>
                     Effect.sync(() => {
@@ -250,6 +270,31 @@ describe("CursorAdapterV2", () => {
         yield* turn();
         assert.equal(opened.length, beforeResumedSend);
         assert.deepEqual(calls.slice(-2), ["resume", "send"]);
+
+        // A failed replacement must not send through, or cache, the old handle.
+        // Exercise this after both successful and failed close attempts.
+        setCredential("Bearer synthetic-retry");
+        failNextResume = true;
+        failNextClose = initialMcp;
+        const sentBeforeFailure = sent.length;
+        const openedBeforeFailure = opened.length;
+        const failure = yield* Effect.flip(turn());
+        assert.equal(failure._tag, "ProviderAdapterTurnStartError");
+        assert.equal(sent.length, sentBeforeFailure);
+        assert.equal(opened.length, openedBeforeFailure + 1);
+        assert.deepEqual(calls.slice(-2), ["close", "resume"]);
+        assertCredential("Bearer synthetic-retry");
+
+        yield* turn();
+        assert.equal(opened.length, openedBeforeFailure + 2);
+        assert.equal(sent.length, sentBeforeFailure + 1);
+        assert.deepEqual(calls.slice(-3), ["resume", "resume", "send"]);
+        assertCredential("Bearer synthetic-retry");
+        for (const attempt of opened) {
+          const logged = loggedCursorAgentOptions(attempt.options);
+          assert.notProperty(logged, "apiKey");
+          assert.notProperty(logged, "mcpServers");
+        }
       }).pipe(Effect.scoped, Effect.provide(Layer.merge(NodeServices.layer, IdAllocator.layer))),
   );
 
