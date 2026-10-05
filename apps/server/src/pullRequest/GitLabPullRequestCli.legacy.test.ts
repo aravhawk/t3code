@@ -26,6 +26,7 @@ const file = {
   b_mode: "100644",
   diff: "@@ -1 +1 @@\n-before\n+after\n",
 };
+/** Supplies JSON at the process boundary while retaining the real CLI adapter and decoder. */
 function output(body: unknown, stdoutTruncated = false) {
   return Effect.succeed({
     exitCode: ChildProcessSpawner.ExitCode(0),
@@ -35,6 +36,7 @@ function output(body: unknown, stdoutTruncated = false) {
     stderrTruncated: false,
   });
 }
+/** Supplies the failure classification produced by VcsProcess for an unsuccessful glab call. */
 function failure(failureKind: "not-found" | "authentication" | "rate-limited" | "command-failed") {
   return Effect.fail(
     new VcsProcessExitError({
@@ -104,6 +106,19 @@ layer("legacy GitLab diff requests through GitLabCli", (it) => {
         const error = yield* cli.getMergeRequestDiff(input).pipe(Effect.flip);
         assert.equal(error._tag, "GitLabMergeRequestReadError");
       }),
+  );
+  it.effect.each([false, true])("marks skipped file entries truncated (legacy: %s)", (legacy) =>
+    Effect.gen(function* () {
+      const entries = [file, { new_path: "missing-old-path.ts" }];
+      if (legacy) run.mockReturnValueOnce(failure("not-found"));
+      run.mockReturnValueOnce(output(legacy ? { changes: entries } : entries));
+      const cli = yield* GitLabPullRequestCli.GitLabPullRequestCli;
+      const result = yield* cli.getMergeRequestDiff(input);
+      expect(result.truncated).toBe(true);
+      expect(result.nextCursor).toBeNull();
+      expect(result.patch.match(/^diff --git /gm)).toHaveLength(1);
+      expect(result.patch).toContain("@@ -1 +1 @@\n-before\n+after\n");
+    }),
   );
   it.effect("rejects a byte-truncated legacy response", () =>
     Effect.gen(function* () {

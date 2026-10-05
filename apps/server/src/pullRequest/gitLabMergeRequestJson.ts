@@ -732,12 +732,16 @@ export function decodeMergeRequestChangesJson(
   });
 }
 
+/** Builds file patches, retaining raw counts and recording files whose contents are missing. */
 function mergeRequestPatch(entries: ReadonlyArray<unknown>): GitLabMergeRequestPatch {
   const sections: string[] = [];
   let truncated = false;
   for (const entry of entries) {
     const file = decodeDiffEntry(entry);
-    if (Exit.isFailure(file)) continue;
+    if (Exit.isFailure(file)) {
+      truncated = true;
+      continue;
+    }
     const value = file.value;
     const hunks = value.diff ?? "";
     if (hunks.length === 0) {
